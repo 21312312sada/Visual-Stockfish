@@ -55,6 +55,10 @@ If the model files are missing, “Load models” will show an error and point y
 - **Stockfish** is loaded from jsDelivr CDN. If your environment blocks cross-origin workers, copy the worker and WASM from `node_modules/stockfish` into `static/stockfish/` and point the app at `/stockfish/stockfish-18-lite-single.js` instead.
 - **Detection** works best with a clear board, good lighting, and the board mostly in frame. “Find corners” needs enough pieces so black/white centers can be used to orient the corners.
 
+## Documentation
+
+See `docs/README.md` for architecture, common issues, and agent workflows.
+
 ## Scripts
 
 | Command          | Description                |
