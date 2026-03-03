@@ -63,29 +63,3 @@ export function getMoveBetween(prevFen: string, newFen: string): { san: string; 
 		return null;
 	}
 }
-
-/**
- * Replay a list of UCI moves from a starting FEN and return the resulting FEN.
- * Returns null if any move is illegal or FEN is invalid.
- */
-export function fenAfterMoves(startFen: string, uciMoves: string[]): string | null {
-	try {
-		const chess = new Chess(startFen);
-		for (const uci of uciMoves) {
-			if (uci.length < 4) return null;
-			const from = uci.slice(0, 2);
-			const to = uci.slice(2, 4);
-			const promotion = uci.length >= 5 ? (uci[4] as 'q' | 'r' | 'b' | 'n') : undefined;
-			const move = chess.move({ from, to, promotion });
-			if (!move) return null;
-		}
-		return chess.fen();
-	} catch {
-		return null;
-	}
-}
-
-/** Returns true if the given UCI move is legal from the given FEN. */
-export function isLegalMove(fen: string, uci: string): boolean {
-	return getSanFromUci(fen, uci) !== null;
-}
