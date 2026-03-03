@@ -12,7 +12,7 @@ Visual Stockfish is a **chess web app** that detects a physical board via camera
 | **Svelte 5** | UI (runes: `$state`, `$effect`) |
 | **TensorFlow.js** | LeYOLO pieces + xcorners models |
 | **Stockfish** | UCI engine (WASM, Web Worker) |
-| **chess.js** | FEN validation, UCI→SAN conversion |
+| **chess.js** | FEN validation, legal-move checks, UCI→SAN, replay (fenAfterMoves) |
 | **vectorious** | Perspective transform math |
 | **delaunator** | Triangulation for corner quads |
 
@@ -75,7 +75,8 @@ Both load the engine from `static/` (same-origin Worker + WASM, no CDN).
 - **Model space**: 480×288 (TensorFlow input). Corners and detections are in this space.
 - **Corner order**: h1, a1, a8, h8 (white’s view).
 - **Side to move**: User selects White/Black when detecting from camera; inferred from FEN when applying manually.
-- **Move history**: Single-move changes from camera or FEN are logged via `getMoveBetween()`.
+- **Move history**: Recorded moves (SAN + UCI) from the starting position. The current position is derived by replaying these moves (`fenAfterMoves()` in `chess.ts`). When history is non-empty, it is the source of truth for the board.
+- **Camera FEN and noise**: Detected FEN from the camera is only applied when it differs from the current position by **exactly one legal move** (checked via `getMoveBetween()` with chess.js). Noisy or ambiguous detections are ignored so they do not overwrite the board.
 
 ## Vite / Svelte Config
 

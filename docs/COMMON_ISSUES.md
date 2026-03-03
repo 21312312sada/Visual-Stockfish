@@ -87,6 +87,17 @@ See `static/480M_pieces_float16/README.md` and `static/480L_xcorners_float16/REA
 - Adjust corners manually if needed.
 - Toggle "Side to move" if the position looks inverted.
 
+### Detection not updating the board (Live or Get FEN)
+
+**Symptom**: Camera or Live FEN runs but the position or move history does not change.
+
+**Cause**: The app only accepts a detected FEN when it differs from the current position by **exactly one legal move**. This avoids overwriting the board with noisy readings (hands, lighting, misdetection). If the detection is ambiguous or no single legal move reaches the detected position, the reading is ignored.
+
+**Fix**:
+- Ensure the board on camera matches the current position except for one move that was just made.
+- Use "Apply FEN" to set the position manually if you need to correct or jump to a position.
+- Clear move history and apply the starting position if you want to start a new game from camera.
+
 ## Development
 
 ### Running the app

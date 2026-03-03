@@ -11,9 +11,10 @@
 	} from '$lib/cameraChess';
 	import type { LoadedModels } from '$lib/cameraChess';
 	import { Chess } from 'chess.js';
-	import { validateFen, getSanFromUci, STARTING_FEN, setFenSideToMove, getMoveBetween, normalizeFenForCompare } from '$lib/chess';
+	import { validateFen, getSanFromUci, STARTING_FEN, setFenSideToMove, getMoveBetween, normalizeFenForCompare, fenAfterMoves } from '$lib/chess';
 	import { StockfishV2 } from '$lib/stockfish-v2';
 
+	const DEBUG = import.meta.env.DEV && false;
 	const PIECE_SYMBOLS: Record<string, string> = {
 		K: '♔', Q: '♕', R: '♖', B: '♗', N: '♘', P: '♙',
 		k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟'
@@ -77,7 +78,7 @@
 	let bestMoveBlack = $state('');
 	let scoreBlack = $state('');
 
-	type MoveLogEntry = { moveNumber: number; side: 'w' | 'b'; san: string; fen: string };
+	type MoveLogEntry = { moveNumber: number; side: 'w' | 'b'; san: string; uci: string; fen: string };
 	let moveHistory = $state<MoveLogEntry[]>([]);
 
 	const CORNERS_STORAGE_KEY = 'visualstockfish-corners';
@@ -188,27 +189,58 @@
 		}
 	}
 
-	function appendMoveToHistoryIfSingle(prevFen: string, newFen: string) {
-		const sideToMovePrev = (prevFen.trim().split(/\s+/)[1] === 'b' ? 'b' : 'w') as 'w' | 'b';
-		if (normalizeFenForCompare(newFen) === normalizeFenForCompare(STARTING_FEN)) {
-			moveHistory = [];
-			return;
-		}
-		const move = getMoveBetween(prevFen, newFen);
-		if (!move) return;
-		const moveNumber = Math.floor(moveHistory.length / 2) + 1;
-		moveHistory = [...moveHistory, { moveNumber, side: sideToMovePrev, san: move.san, fen: newFen }];
+	/** Current position from move history (source of truth when history exists). */
+	function canonicalFen(): string {
+		if (moveHistory.length === 0) return previousFen ?? fen;
+		const uciMoves = moveHistory.map((e) => e.uci);
+		const derived = fenAfterMoves(STARTING_FEN, uciMoves);
+		return derived ?? fen;
 	}
 
-	function applyDetectedFen(newFen: string) {
-		if (previousFen !== null) {
-			sideToMove = inferSideToMoveFromDiff(previousFen, newFen);
-			appendMoveToHistoryIfSingle(previousFen, newFen);
+	/**
+	 * Only append to move history when exactly one legal move leads from current position to newFen.
+	 * Returns true if the move was accepted and state was updated.
+	 */
+	function appendMoveToHistoryIfSingle(prevFen: string, newFen: string): boolean {
+		if (normalizeFenForCompare(newFen) === normalizeFenForCompare(STARTING_FEN)) {
+			moveHistory = [];
+			fen = STARTING_FEN;
+			fenInput = STARTING_FEN;
+			previousFen = STARTING_FEN;
+			return true;
 		}
-		previousFen = newFen;
-		fen = newFen;
-		fenInput = newFen;
-		error = '';
+		const move = getMoveBetween(prevFen, newFen);
+		if (!move) return false;
+		const sideToMovePrev = (prevFen.trim().split(/\s+/)[1] === 'b' ? 'b' : 'w') as 'w' | 'b';
+		const moveNumber = Math.floor(moveHistory.length / 2) + 1;
+		moveHistory = [...moveHistory, { moveNumber, side: sideToMovePrev, san: move.san, uci: move.uci, fen: newFen }];
+		const newPositionFen = fenAfterMoves(STARTING_FEN, moveHistory.map((e) => e.uci));
+		if (newPositionFen) {
+			fen = newPositionFen;
+			fenInput = newPositionFen;
+			previousFen = newPositionFen;
+		}
+		return true;
+	}
+
+	/**
+	 * Apply FEN from camera only when it differs from current position by exactly one legal move.
+	 * Noisy or ambiguous detections are ignored so they don't overwrite the board.
+	 */
+	function applyDetectedFen(newFen: string) {
+		const current = canonicalFen();
+		if (normalizeFenForCompare(newFen) === normalizeFenForCompare(current)) {
+			error = '';
+			return;
+		}
+		const accepted = appendMoveToHistoryIfSingle(current, newFen);
+		if (accepted) {
+			sideToMove = inferSideToMoveFromDiff(current, fen);
+			error = '';
+		} else {
+			if (DEBUG) console.log('[visualstockfish:fen] Ignoring detection (no single legal move from current position)');
+			// Do not overwrite fen/fenInput/previousFen with noisy FEN
+		}
 	}
 
 	async function startCamera() {
@@ -382,16 +414,29 @@
 
 	function applyFen() {
 		const raw = fenInput.trim();
-		if (validateFen(raw)) {
-			if (previousFen !== null) appendMoveToHistoryIfSingle(previousFen, raw);
-			else if (raw === STARTING_FEN) moveHistory = [];
+		if (!validateFen(raw)) {
+			error = 'Invalid FEN';
+			return;
+		}
+		if (raw === STARTING_FEN) {
+			moveHistory = [];
 			fen = raw;
 			fenInput = raw;
 			previousFen = raw;
 			error = '';
-		} else {
-			error = 'Invalid FEN';
+			return;
 		}
+		const current = canonicalFen();
+		if (appendMoveToHistoryIfSingle(current, raw)) {
+			error = '';
+			return;
+		}
+		// Manual FEN that isn't one legal move from current: set position and clear history
+		moveHistory = [];
+		fen = raw;
+		fenInput = raw;
+		previousFen = raw;
+		error = '';
 	}
 
 	async function loadEngine() {
