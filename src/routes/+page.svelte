@@ -1,5 +1,6 @@
 <script lang="ts">
 	const DEBUG = import.meta.env.DEV && false; // set to true for move-history/FEN logs
+	const DEBUG_LIVE = import.meta.env.DEV && false; // set to true for live/camera diagnostics (console + UI)
 
 	import '@tensorflow/tfjs-backend-webgl';
 	import { onDestroy, onMount } from 'svelte';
@@ -13,7 +14,16 @@
 	} from '$lib/cameraChess';
 	import type { LoadedModels } from '$lib/cameraChess';
 	import { Chess } from 'chess.js';
-	import { validateFen, getSanFromUci, STARTING_FEN, setFenSideToMove, getMoveBetween, normalizeFenForCompare } from '$lib/chess';
+	import {
+		validateFen,
+		getSanFromUci,
+		STARTING_FEN,
+		setFenSideToMove,
+		getMoveBetween,
+		normalizeFenForCompare,
+		findMinimalPath,
+		applyMovesToFen
+	} from '$lib/chess';
 	import { StockfishV2 } from '$lib/stockfish-v2';
 
 	const PIECE_SYMBOLS: Record<string, string> = {
@@ -55,8 +65,26 @@
 	let previousFen = $state<string | null>(null);
 	let liveFen = $state(false);
 	let liveIntervalId = 0;
-	let findFenInProgress = false;
+	let findFenInProgress = $state(false);
 	const LIVE_FEN_INTERVAL_MS = 2200;
+	const LIVE_FIND_FEN_TIMEOUT_MS = 15000; // prevent live from staying stuck if findFen hangs
+
+	// Live diagnostics (visible in UI when DEBUG_LIVE; always updated for first-run fix)
+	type LiveSkipReason = 'none' | 'findFenBusy' | 'engineAnalyzing' | 'videoNotReady' | 'missingSetup';
+	let liveLastTickAt = $state(0);
+	let liveLastSkipReason = $state<LiveSkipReason>('none');
+	let liveLastResult = $state<'ok' | 'applied' | 'rejected' | 'error' | 'timeout' | 'skipped'>('skipped');
+	let liveLastApplyReason = $state<string>(''); // why applyDetectedFen accepted or ignored
+	let liveTickCount = $state(0);
+	let liveAppliedCount = $state(0);
+	let liveVideoTime = $state<number | null>(null); // video.currentTime when we last read (diagnostic)
+	let liveRawFen = $state(''); // last FEN string returned by findFen (diagnostic)
+	let lastRejectedGuessFen = $state(''); // latest camera FEN that was rejected (for second board in Position card)
+	let pathCurrentToCamera = $state<string[] | null>(null); // minimal moves from current position to camera (rejected) position
+	let pathCameraToCurrent = $state<string[] | null>(null); // minimal moves from camera to current (so revert = use camera FEN)
+	let liveFrameMode = $state<'interval' | 'videoFrame'>('interval'); // how we're scheduling ticks
+	const RECONCILE_MAX_DEPTH = 5;
+	let liveVideoFrameCallbackId = 0; // for cancelVideoFrameCallback when Live turns off
 	let overlaySvgEl = $state<SVGSVGElement | null>(null);
 	let draggingCorner = $state<number | null>(null);
 	let videoDevices = $state<{ deviceId: string; label: string }[]>([]);
@@ -115,6 +143,10 @@
 	}
 
 	async function loadVideoDevices() {
+		if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) {
+			videoDevices = [];
+			return;
+		}
 		try {
 			const devices = await navigator.mediaDevices.enumerateDevices();
 			const inputs = devices
@@ -205,11 +237,12 @@
 	/**
 	 * Apply camera/detection FEN only when it's trusted: same position or exactly one legal move from previous.
 	 * When fromLive is true, rejected FEN is ignored without setting error (avoids flicker from hand movement etc.).
+	 * Returns a short reason for diagnostics: 'first' | 'same' | 'move' | 'invalid' | 'not_legal'
 	 */
-	function applyDetectedFen(newFen: string, fromLive = false) {
+	function applyDetectedFen(newFen: string, fromLive = false): 'first' | 'same' | 'move' | 'invalid' | 'not_legal' {
 		if (!validateFen(newFen)) {
 			if (!fromLive) error = 'Invalid FEN from detection';
-			return;
+			return 'invalid';
 		}
 		if (previousFen === null) {
 			// First application: accept any valid FEN and set baseline
@@ -221,7 +254,7 @@
 			fenInput = newFen;
 			error = '';
 			if (DEBUG) console.log('[applyDetectedFen] first apply', newFen.slice(0, 30) + '…');
-			return;
+			return 'first';
 		}
 		const samePosition = normalizeFenForCompare(newFen) === normalizeFenForCompare(previousFen);
 		if (samePosition) {
@@ -229,7 +262,7 @@
 			fen = newFen;
 			fenInput = newFen;
 			error = '';
-			return;
+			return 'same';
 		}
 		const move = getMoveBetween(previousFen, newFen);
 		if (move) {
@@ -240,15 +273,21 @@
 			fenInput = newFen;
 			error = '';
 			if (DEBUG) console.log('[applyDetectedFen] move appended', move.san);
-		} else {
-			if (!fromLive) error = 'Position is not a legal continuation; ignored.';
-			if (DEBUG) console.log('[applyDetectedFen] rejected (not single legal move)', newFen.slice(0, 40) + '…');
+			return 'move';
 		}
+		if (!fromLive) error = 'Position is not a legal continuation; ignored.';
+		if (DEBUG) console.log('[applyDetectedFen] rejected (not single legal move)', newFen.slice(0, 40) + '…');
+		return 'not_legal';
 	}
 
 	async function startCamera() {
 		error = '';
 		status = 'loading-camera';
+		if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+			error = 'Camera not available. Use HTTPS and a supported browser (e.g. Chrome).';
+			status = 'idle';
+			return;
+		}
 		try {
 			const videoConstraints: MediaTrackConstraints = {
 				width: { ideal: 640 },
@@ -301,26 +340,116 @@
 		previousFen = null;
 	}
 
+	function runLiveTick() {
+		liveLastTickAt = Date.now();
+		liveTickCount += 1;
+		if (!videoEl || !keypoints || !models) {
+			liveLastSkipReason = 'missingSetup';
+			if (DEBUG_LIVE) console.log('[Live] tick skipped: missing video/keypoints/models');
+			return;
+		}
+		if (invalidVideo({ current: videoEl })) {
+			liveLastSkipReason = 'videoNotReady';
+			if (DEBUG_LIVE) console.log('[Live] tick skipped: video not ready');
+			return;
+		}
+		if (findFenInProgress) {
+			liveLastSkipReason = 'findFenBusy';
+			if (DEBUG_LIVE) console.log('[Live] tick skipped: findFen still in progress');
+			return;
+		}
+		if (engineLoading) {
+			liveLastSkipReason = 'engineAnalyzing';
+			if (DEBUG_LIVE) console.log('[Live] tick skipped: Stockfish analyzing');
+			return;
+		}
+		liveLastSkipReason = 'none';
+		findFenInProgress = true;
+		// Capture video time so we can see if we're reading new frames (diagnostic)
+		const videoTime = videoEl.currentTime;
+		liveVideoTime = videoTime;
+		if (DEBUG_LIVE) console.log('[Live] findFen start — video.currentTime=', videoTime.toFixed(2));
+		const findFenPromise = findFen({ current: videoEl }, models.pieces, keypoints, sideToMove);
+		const timeoutPromise = new Promise<never>((_, reject) =>
+			setTimeout(() => reject(new Error('findFen timeout')), LIVE_FIND_FEN_TIMEOUT_MS)
+		);
+		Promise.race([findFenPromise, timeoutPromise])
+			.then((result) => {
+				liveRawFen = result.fen ?? '';
+				if (result.fen) {
+					const applyOutcome = applyDetectedFen(result.fen, true);
+					liveLastApplyReason = applyOutcome;
+					if (applyOutcome === 'first' || applyOutcome === 'same' || applyOutcome === 'move') {
+						liveLastResult = 'applied';
+						liveAppliedCount += 1;
+						if (DEBUG_LIVE) console.log('[Live] findFen applied', applyOutcome, 'fen=', result.fen, 'videoTime was', videoTime.toFixed(2));
+					} else {
+						liveLastResult = 'rejected';
+						lastRejectedGuessFen = result.fen;
+						if (DEBUG_LIVE) console.log('[Live] findFen had FEN but apply ignored:', applyOutcome, 'fen=', result.fen);
+					}
+				} else {
+					liveLastResult = 'rejected';
+					liveLastApplyReason = result.error ?? 'no fen';
+					if (DEBUG_LIVE) console.log('[Live] findFen rejected', result.error ?? 'no fen', 'videoTime was', videoTime.toFixed(2));
+				}
+			})
+			.catch((err) => {
+				liveLastResult = err?.message === 'findFen timeout' ? 'timeout' : 'error';
+				if (DEBUG_LIVE) console.warn('[Live] findFen failed', err);
+			})
+			.finally(() => {
+				findFenInProgress = false;
+				if (DEBUG_LIVE) console.log('[Live] findFen done, result=', liveLastResult);
+			});
+	}
+
 	function setLiveFen(on: boolean) {
 		liveFen = on;
 		if (liveIntervalId) {
 			clearInterval(liveIntervalId);
 			liveIntervalId = 0;
 		}
-		if (on && models && keypoints && videoEl) {
-			liveIntervalId = window.setInterval(() => {
-				if (!videoEl || !keypoints || !models || invalidVideo({ current: videoEl })) return;
-				if (findFenInProgress || engineLoading) return;
-				findFenInProgress = true;
-				findFen({ current: videoEl }, models.pieces, keypoints, sideToMove)
-					.then((result) => {
-						if (result.fen) applyDetectedFen(result.fen, true);
-					})
-					.catch(() => {})
-					.finally(() => {
-						findFenInProgress = false;
+		if (liveVideoFrameCallbackId && videoEl?.cancelVideoFrameCallback) {
+			videoEl.cancelVideoFrameCallback(liveVideoFrameCallbackId);
+			liveVideoFrameCallbackId = 0;
+		}
+		if (!on) {
+			liveVideoTime = null;
+			liveRawFen = '';
+			return;
+		}
+		if (models && keypoints && videoEl) {
+			// Reset baseline so the next detection is accepted as "first" and the board updates to camera
+			previousFen = null;
+			liveLastApplyReason = '';
+			// Use requestVideoFrameCallback when available so we only run on NEW frames (avoids same-frame reads)
+			const useVideoFrameCallback =
+				typeof videoEl.requestVideoFrameCallback === 'function' &&
+				typeof videoEl.cancelVideoFrameCallback === 'function';
+			if (useVideoFrameCallback) {
+				liveFrameMode = 'videoFrame';
+				let lastRunAt = 0;
+				const scheduleNext = () => {
+					if (!liveFen || !videoEl) return;
+					liveVideoFrameCallbackId = videoEl.requestVideoFrameCallback((_now, _meta) => {
+						liveVideoFrameCallbackId = 0;
+						// Throttle: only run findFen every LIVE_FEN_INTERVAL_MS so we don't overload
+						const now = Date.now();
+						if (now - lastRunAt >= LIVE_FEN_INTERVAL_MS) {
+							lastRunAt = now;
+							runLiveTick();
+						}
+						scheduleNext();
 					});
-			}, LIVE_FEN_INTERVAL_MS);
+				};
+				lastRunAt = 0;
+				scheduleNext();
+			} else {
+				liveFrameMode = 'interval';
+				liveIntervalId = window.setInterval(runLiveTick, LIVE_FEN_INTERVAL_MS);
+				runLiveTick();
+			}
 		}
 	}
 
@@ -349,6 +478,55 @@
 		const kp = keypoints;
 		if (kp && kp.length === 4) saveCorners(kp);
 	});
+
+	// Recompute minimal path between current position and rejected camera guess (for reconciliation)
+	$effect(() => {
+		const rejected = lastRejectedGuessFen;
+		const current = fen;
+		if (!rejected?.trim() || !validateFen(rejected) || !validateFen(current)) {
+			pathCurrentToCamera = null;
+			pathCameraToCurrent = null;
+			return;
+		}
+		if (normalizeFenForCompare(current) === normalizeFenForCompare(rejected)) {
+			pathCurrentToCamera = null;
+			pathCameraToCurrent = null;
+			return;
+		}
+		pathCurrentToCamera = findMinimalPath(current, rejected, RECONCILE_MAX_DEPTH);
+		pathCameraToCurrent = findMinimalPath(rejected, current, RECONCILE_MAX_DEPTH);
+	});
+
+	function syncToCameraPosition() {
+		if (!pathCurrentToCamera?.length || !lastRejectedGuessFen) return;
+		let prev = fen;
+		for (const san of pathCurrentToCamera) {
+			const next = applyMovesToFen(prev, [san]);
+			if (!next) return;
+			sideToMove = inferSideToMoveFromDiff(prev, next);
+			appendMoveToHistoryIfSingle(prev, next);
+			prev = next;
+		}
+		previousFen = prev;
+		fen = prev;
+		fenInput = prev;
+		lastRejectedGuessFen = '';
+		pathCurrentToCamera = null;
+		pathCameraToCurrent = null;
+		error = '';
+	}
+
+	function revertToCameraPosition() {
+		if (!lastRejectedGuessFen || !validateFen(lastRejectedGuessFen)) return;
+		previousFen = lastRejectedGuessFen;
+		fen = lastRejectedGuessFen;
+		fenInput = lastRejectedGuessFen;
+		sideToMove = (lastRejectedGuessFen.trim().split(/\s+/)[1] === 'b' ? 'b' : 'w') as 'w' | 'b';
+		lastRejectedGuessFen = '';
+		pathCurrentToCamera = null;
+		pathCameraToCurrent = null;
+		error = '';
+	}
 
 	onMount(() => {
 		const saved = loadSavedCorners();
@@ -660,6 +838,28 @@
 					{/if}
 				{/if}
 			</div>
+			{#if liveFen}
+				<div class="live-diagnostics" role="status" aria-live="polite">
+					<p class="live-diag-title">Live status</p>
+					<ul class="live-diag-list">
+						<li>Camera: {findFenInProgress ? 'reading…' : 'idle'}</li>
+						<li>Engine: {engineLoading ? 'analyzing (' + (analysisPhase === 'white' ? 'White' : 'Black') + ')' : 'idle'}</li>
+						<li>Last tick: {liveLastTickAt ? new Date(liveLastTickAt).toLocaleTimeString() : '—'}</li>
+						<li>Last result: {liveLastResult}{#if liveLastApplyReason} ({liveLastApplyReason}){/if}</li>
+						{#if liveLastSkipReason !== 'none'}
+							<li>Skip reason: {liveLastSkipReason}</li>
+						{/if}
+						<li>Ticks: {liveTickCount} — Board updated: {liveAppliedCount}</li>
+						<li>Frame mode: {liveFrameMode} — Video time when read: {liveVideoTime != null ? liveVideoTime.toFixed(1) + 's' : '—'}</li>
+						{#if liveRawFen}
+							<li>Last raw FEN: <code class="live-raw-fen">{liveRawFen}</code></li>
+						{/if}
+					</ul>
+					{#if DEBUG_LIVE}
+						<p class="live-diag-debug">Debug mode: see console for [Live] logs.</p>
+					{/if}
+				</div>
+			{/if}
 			{#if keypoints}
 				<div class="orientation-bar">
 					<span class="orientation-label">Side to move</span>
@@ -688,16 +888,45 @@
 					<button class="btn btn-primary fen-apply" onclick={applyFen}>Apply</button>
 				</div>
 			</div>
-			<div class="board-section">
-				<div class="board-visual" aria-hidden="true">
-					{#each boardFromFen(fen) as rank, ri}
-						{#each rank as piece, ci}
-							<span class="board-square" class:light={(ri + ci) % 2 === 0}>
-								{piece ?? ''}
-							</span>
+			<div class="boards-row">
+				<div class="board-section">
+					<p class="board-label">Current position</p>
+					<div class="board-visual" aria-hidden="true">
+						{#each boardFromFen(fen) as rank, ri}
+							{#each rank as piece, ci}
+								<span class="board-square" class:light={(ri + ci) % 2 === 0}>
+									{piece ?? ''}
+								</span>
+							{/each}
 						{/each}
-					{/each}
+					</div>
 				</div>
+				{#if lastRejectedGuessFen}
+					<div class="board-section board-section-rejected">
+						<p class="board-label">Last rejected guess (camera)</p>
+						<div class="board-visual board-visual-rejected" aria-hidden="true">
+							{#each boardFromFen(lastRejectedGuessFen) as rank, ri}
+								{#each rank as piece, ci}
+									<span class="board-square" class:light={(ri + ci) % 2 === 0}>
+										{piece ?? ''}
+									</span>
+								{/each}
+							{/each}
+						</div>
+						<p class="board-fen-caption">{lastRejectedGuessFen}</p>
+						<div class="reconcile-actions">
+							{#if pathCurrentToCamera && pathCurrentToCamera.length > 0}
+								<p class="reconcile-desc">Current → Camera: <strong>{pathCurrentToCamera.length} move{pathCurrentToCamera.length === 1 ? '' : 's'}</strong> — {pathCurrentToCamera.join(', ')}</p>
+								<button type="button" class="btn btn-small btn-primary" onclick={syncToCameraPosition}>Apply to sync to camera</button>
+							{:else if pathCameraToCurrent && pathCameraToCurrent.length > 0}
+								<p class="reconcile-desc">Camera is behind: current is <strong>{pathCameraToCurrent.length} move{pathCameraToCurrent.length === 1 ? '' : 's'}</strong> ahead — {pathCameraToCurrent.join(', ')}</p>
+								<button type="button" class="btn btn-small" onclick={revertToCameraPosition}>Revert to camera position</button>
+							{:else if lastRejectedGuessFen}
+								<p class="reconcile-desc">No path found within {RECONCILE_MAX_DEPTH} moves (positions may differ by more moves or be unreachable).</p>
+							{/if}
+						</div>
+					</div>
+				{/if}
 			</div>
 			<div class="engine-block">
 				{#if !engine}
@@ -908,6 +1137,36 @@
 		border-top: 1px solid var(--border);
 	}
 
+	.live-diagnostics {
+		margin-top: 0.75rem;
+		padding: 0.75rem;
+		background: var(--surface);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+	}
+	.live-diag-title {
+		font-weight: 600;
+		color: var(--text);
+		margin: 0 0 0.35rem 0;
+	}
+	.live-diag-list {
+		margin: 0;
+		padding-left: 1.25rem;
+		line-height: 1.5;
+	}
+	.live-diag-debug {
+		margin: 0.5rem 0 0 0;
+		font-style: italic;
+		opacity: 0.9;
+	}
+	.live-raw-fen {
+		font-family: ui-monospace, monospace;
+		font-size: 0.75rem;
+		word-break: break-all;
+	}
+
 	.camera-select-wrap {
 		display: inline-flex;
 		align-items: center;
@@ -1036,10 +1295,51 @@
 	.fen-apply {
 		flex-shrink: 0;
 	}
+	.boards-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1.5rem;
+		margin-bottom: 1.25rem;
+		align-items: flex-start;
+	}
 	.board-section {
 		width: 100%;
-		margin-bottom: 1.25rem;
 		min-height: 280px;
+	}
+	.boards-row .board-section {
+		width: auto;
+	}
+	.board-label {
+		margin: 0 0 0.35rem 0;
+		font-size: 0.8125rem;
+		font-weight: 600;
+		color: var(--text-muted);
+	}
+	.board-section-rejected .board-label {
+		color: var(--accent);
+	}
+	.board-fen-caption {
+		margin: 0.35rem 0 0 0;
+		font-size: 0.6875rem;
+		color: var(--text-muted);
+		font-family: ui-monospace, monospace;
+		word-break: break-all;
+		max-width: 280px;
+	}
+	.reconcile-actions {
+		margin-top: 0.75rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+	.reconcile-desc {
+		margin: 0;
+		font-size: 0.8125rem;
+		color: var(--text-muted);
+	}
+	.board-visual-rejected {
+		border-color: var(--accent);
+		box-shadow: 0 0 0 2px rgba(var(--accent-rgb, 100, 149, 237), 0.2);
 	}
 	.board-visual {
 		display: grid;

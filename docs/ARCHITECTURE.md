@@ -57,6 +57,8 @@ VisualStockFish/
 3. **Find corners** – `findCorners()` detects 4 board corners (h1, a1, a8, h8)
 4. **Get FEN** – `findFen()` warps frame, runs pieces model, maps detections to squares, outputs FEN
 
+**Live FEN**: When Live is on, detection runs on new video frames (via `requestVideoFrameCallback` when available, else a 2.2s interval). First read runs immediately when turning Live on. A 15s timeout prevents `findFen` from blocking indefinitely. Rejected camera FENs are shown in a “Last rejected guess” board; the app can find a minimal move path between current and rejected position (see Reconciliation).
+
 ### FEN → Stockfish
 
 - **Manual flow**: User pastes/edits FEN → Apply → Load Stockfish → Get best move
@@ -76,6 +78,7 @@ Both load the engine from `static/` (same-origin Worker + WASM, no CDN).
 - **Corner order**: h1, a1, a8, h8 (white’s view).
 - **Side to move**: User selects White/Black when detecting from camera; inferred from FEN when applying manually.
 - **Move history**: Single-move changes from camera or FEN are logged via `getMoveBetween()` (chess.js legal moves). Camera FEN is only applied when it is the same position or exactly one legal move from the previous position, so noisy readings (e.g. hand movement) are ignored and history stays accurate. Live updates never show an error when a reading is rejected.
+- **Reconciliation**: When the camera returns a FEN that is rejected (not same position, not one legal move), the UI shows that “Last rejected guess” and a second board. `findMinimalPath()` (in `chess.ts`) finds the shortest sequence of legal moves (BFS, up to 5 moves) from current position to camera position or vice versa. The user can “Apply to sync to camera” (play those moves) or “Revert to camera position” to align the app with what the camera sees when a move was missed.
 
 ## Vite / Svelte Config
 

@@ -91,7 +91,7 @@ See `static/480M_pieces_float16/README.md` and `static/480L_xcorners_float16/REA
 
 **Cause**: The detected position is not exactly one legal move from the current position (e.g. misdetection, board bumped, or a different position). The app only applies camera FEN when it matches the previous position or is a single legal move from it, so move history stays correct.
 
-**Fix**: Ensure the board state matches the last applied position, or apply the correct FEN manually. With "Live" on, invalid or non-continuation readings are ignored without showing an error.
+**Fix**: Ensure the board state matches the last applied position, or apply the correct FEN manually. With "Live" on, invalid or non-continuation readings are ignored without showing an error. Use the "Last rejected guess" board and "Apply to sync to camera" / "Revert to camera position" when the camera missed a move and the two positions are within a few moves.
 
 ## Development
 

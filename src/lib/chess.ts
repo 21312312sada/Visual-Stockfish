@@ -63,3 +63,64 @@ export function getMoveBetween(prevFen: string, newFen: string): { san: string; 
 		return null;
 	}
 }
+
+/**
+ * Find a shortest sequence of legal moves from fromFen to the position in toFen.
+ * Compares positions by normalized FEN (first 4 fields). Returns SAN moves, or null if not found within maxDepth.
+ */
+export function findMinimalPath(
+	fromFen: string,
+	toFen: string,
+	maxDepth: number
+): string[] | null {
+	try {
+		const targetNorm = normalizeFenForCompare(toFen);
+		const startNorm = normalizeFenForCompare(fromFen);
+		if (startNorm === targetNorm) return [];
+
+		type Node = { fen: string; path: string[] };
+		const queue: Node[] = [{ fen: fromFen, path: [] }];
+		const visited = new Set<string>([startNorm]);
+
+		while (queue.length > 0) {
+			const { fen, path } = queue.shift()!;
+			if (path.length >= maxDepth) continue;
+
+			const chess = new Chess(fen);
+			const moves = chess.moves({ verbose: true });
+
+			for (const m of moves) {
+				const next = new Chess(fen);
+				next.move(m);
+				const nextFen = next.fen();
+				const nextNorm = normalizeFenForCompare(nextFen);
+
+				if (nextNorm === targetNorm) return [...path, m.san];
+
+				if (!visited.has(nextNorm)) {
+					visited.add(nextNorm);
+					queue.push({ fen: nextFen, path: [...path, m.san] });
+				}
+			}
+		}
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Apply a sequence of SAN moves to a FEN position; returns the resulting FEN or null if any move is illegal.
+ */
+export function applyMovesToFen(fen: string, moves: string[]): string | null {
+	try {
+		const chess = new Chess(fen);
+		for (const san of moves) {
+			const result = chess.move(san);
+			if (!result) return null;
+		}
+		return chess.fen();
+	} catch {
+		return null;
+	}
+}
