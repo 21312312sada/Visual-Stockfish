@@ -1,0 +1,9 @@
+to run the server:
+npm run dev
+
+If Stockfish does not load (e.g. CDN blocked), run once to fetch the engine locally:
+node scripts/download-stockfish.js
+
+Two FEN / Stockfish flows:
+- Top (manual): Position comes from camera or the main FEN input; you click "Apply FEN" then "Get best move". Same engine (stockfish.ts), now uses same local direct-worker loading as the bottom section.
+- Bottom (alternate): Its own FEN input; position auto-applies after you stop typing (debounce), and the engine re-evaluates automatically. Uses stockfish-v2.ts (direct worker only).
