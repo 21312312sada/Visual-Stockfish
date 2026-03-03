@@ -53,7 +53,8 @@
 	let previousFen = $state<string | null>(null);
 	let liveFen = $state(false);
 	let liveIntervalId = 0;
-	const LIVE_FEN_INTERVAL_MS = 1800;
+	let findFenInProgress = false;
+	const LIVE_FEN_INTERVAL_MS = 2200;
 	let overlaySvgEl = $state<SVGSVGElement | null>(null);
 	let draggingCorner = $state<number | null>(null);
 	let videoDevices = $state<{ deviceId: string; label: string }[]>([]);
@@ -274,13 +275,18 @@
 		if (on && models && keypoints && videoEl) {
 			liveIntervalId = window.setInterval(() => {
 				if (!videoEl || !keypoints || !models || invalidVideo({ current: videoEl })) return;
+				if (findFenInProgress || engineLoading) return;
+				findFenInProgress = true;
 				findFen({ current: videoEl }, models.pieces, keypoints, sideToMove)
 					.then((result) => {
 						if (result.fen && validateFen(result.fen)) {
 							applyDetectedFen(result.fen);
 						}
 					})
-					.catch(() => {});
+					.catch(() => {})
+					.finally(() => {
+						findFenInProgress = false;
+					});
 			}, LIVE_FEN_INTERVAL_MS);
 		}
 	}
@@ -401,7 +407,7 @@
 							bestMoveWhite = m.move;
 							scoreWhite = score || '';
 							analysisPhase = 'black';
-							e.setPosition(analysisFenBlack).then(() => e.goDepth(16));
+							e.setPosition(analysisFenBlack).then(() => e.goDepth(12));
 						} else if (analysisPhase === 'black') {
 							bestMoveBlack = m.move;
 							scoreBlack = score || '';
@@ -458,7 +464,7 @@
 		analysisPhase = 'white';
 		try {
 			await engine.setPosition(analysisFenWhite);
-			engine.goDepth(16);
+			engine.goDepth(12);
 		} catch {
 			engineLoading = false;
 			analysisPhase = 'idle';
@@ -469,7 +475,8 @@
 	let lastEvaluatedFen = $state('');
 	$effect(() => {
 		const f = fen;
-		if (!engine?.isReady() || f === lastEvaluatedFen) return;
+		const loading = engineLoading;
+		if (!engine?.isReady() || f === lastEvaluatedFen || loading) return;
 		lastEvaluatedFen = f;
 		getBestMove();
 	});

@@ -1,5 +1,21 @@
 # Common Issues
 
+## App crash / freeze (GPU or CPU overload)
+
+**Symptom**: Browser tab crashes, freezes, or becomes unresponsive, especially with camera + Live FEN + Stockfish.
+
+**Cause**: Stockfish runs on **CPU** (WASM), while TensorFlow.js (piece/corner detection) uses **GPU** (WebGL). Running both heavily at once—Live FEN every ~2s, Stockfish depth 16 for White and Black—can overload the system.
+
+**Fix** (addressed in the app):
+- Live FEN pauses while Stockfish is analyzing.
+- Camera inference is serialized (no overlapping `findFen` calls).
+- Stockfish depth reduced from 16 to 12 to lower CPU load.
+- Live FEN interval slightly increased to reduce load.
+
+**Workarounds**:
+- Turn off "Live" when using Stockfish; use "Get FEN" manually instead.
+- Use a lighter browser tab load (fewer extensions, other tabs).
+
 ## Stockfish / Engine
 
 ### Stockfish does not load (CDN blocked, 403)
